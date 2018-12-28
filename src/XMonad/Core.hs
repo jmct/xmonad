@@ -22,10 +22,10 @@ module XMonad.Core (
     XConf(..), XConfig(..), LayoutClass(..),
     Layout(..), readsLayout, Typeable, Message,
     SomeMessage(..), fromMessage, LayoutMessages(..),
-    StateExtension(..), ExtensionClass(..),
+    StateExtension(..), ExtensionClass(..), Recompile(..),
     runX, catchX, userCode, userCodeDef, io, catchIO, installSignalHandlers, uninstallSignalHandlers,
     withDisplay, withWindowSet, isRoot, runOnWorkspaces,
-    getAtom, spawn, spawnPID, xfork, recompile, trace, whenJust, whenX,
+    getAtom, spawn, spawnPID, xfork, recompile, recompSuccess, trace, whenJust, whenX,
     getXMonadDir, getXMonadCacheDir, getXMonadDataDir, stateFileName,
     atom_WM_STATE, atom_WM_PROTOCOLS, atom_WM_DELETE_WINDOW, atom_WM_TAKE_FOCUS, withWindowAttributes,
     ManageHook, Query(..), runQuery
@@ -571,6 +571,8 @@ data XDGDirectory = XDGData | XDGConfig | XDGCache
 stateFileName :: (Functor m, MonadIO m) => m FilePath
 stateFileName = (</> "xmonad.state") <$> getXMonadDataDir
 
+data Recompile = Needed Bool | RecompError
+
 -- | 'recompile force', recompile the xmonad configuration file when
 -- any of the following apply:
 --
@@ -588,9 +590,9 @@ stateFileName = (</> "xmonad.state") <$> getXMonadDataDir
 -- in the xmonad data directory.  If GHC indicates failure with a
 -- non-zero exit code, an xmessage displaying that file is spawned.
 --
--- 'False' is returned if there are compilation errors.
+-- 'RecompError' is returned if there are compilation errors.
 --
-recompile :: MonadIO m => Bool -> m Bool
+recompile :: MonadIO m => Bool -> m Recompile
 recompile force = io $ do
     cfgdir  <- getXMonadDir
     datadir <- getXMonadDataDir
@@ -613,35 +615,39 @@ recompile force = io $ do
           if isExe
             then do
               trace $ "XMonad will use build script at " ++ show buildscript ++ " to recompile."
-              return True
+              return (Needed True)
             else do
               trace $ unlines
                 [ "XMonad will not use build script, because " ++ show buildscript ++ " is not executable."
                 , "Suggested resolution to use it: chmod u+x " ++ show buildscript
                 ]
-              return False
+              return RecompError
         else do
           trace $
             "XMonad will use ghc to recompile, because " ++ show buildscript ++ " does not exist."
-          return False
+          return (Needed False)
 
     shouldRecompile <-
-      if useBuildscript || force
-        then return True
-        else if any (binT <) (srcT : libTs)
-          then do
-            trace "XMonad doing recompile because some files have changed."
-            return True
-          else do
-            trace "XMonad skipping recompile because it is not forced (e.g. via --recompile), and neither xmonad.hs nor any *.hs / *.lhs / *.hsc files in lib/ have been changed."
-            return False
+      case useBuildscript of
+        Needed useBS ->
+          if useBS || force
+            then return (Needed True)
+            else if any (binT <) (srcT : libTs)
+              then do
+                trace "XMonad doing recompile because some files have changed."
+                return (Needed True)
+              else do
+                trace "XMonad skipping recompile because it is not forced (e.g. via --recompile), and neither xmonad.hs nor any *.hs / *.lhs / *.hsc files in lib/ have been changed."
+                return (Needed False)
+        RecompError  -> return RecompError
 
-    if shouldRecompile
-      then do
+
+    case shouldRecompile of
+      Needed True -> do
         -- temporarily disable SIGCHLD ignoring:
         uninstallSignalHandlers
         status <- bracket (openFile err WriteMode) hClose $ \errHandle ->
-            waitForProcess =<< if useBuildscript
+            waitForProcess =<< if recompToBool useBuildscript
                                then compileScript bin cfgdir buildscript errHandle
                                else compileGHC bin cfgdir errHandle
 
@@ -662,8 +668,9 @@ recompile force = io $ do
                 hPutStrLn stderr msg
                 forkProcess $ executeFile "xmessage" True ["-default", "okay", replaceUnicode msg] Nothing
                 return ()
-        return (status == ExitSuccess)
-      else return True
+        return (if status == ExitSuccess then Needed True else RecompError)
+      Needed False -> return (Needed False)
+      RecompError  -> return RecompError
  where getModTime f = E.catch (Just <$> getModificationTime f) (\(SomeException _) -> return Nothing)
        isSource = flip elem [".hs",".lhs",".hsc"] . takeExtension
        isExecutable f = E.catch (executable <$> getPermissions f) (\(SomeException _) -> return False)
@@ -690,6 +697,17 @@ recompile force = io $ do
                           ] (Just dir) Nothing Nothing Nothing (Just errHandle)
        compileScript bin dir script errHandle =
          runProcess script [bin] (Just dir) Nothing Nothing Nothing (Just errHandle)
+
+-- | Convert a @Recompile@ to a @Bool@ when you want to condition
+-- on whether it was successful or an error. `True` for success, `False` for
+-- an error
+recompToBool :: Recompile -> Bool
+recompToBool (Needed b)  = b
+recompToBool RecompError = False
+
+recompSuccess :: Recompile -> Bool
+recompSuccess (Needed _)  = True
+recompSuccess RecompError = False
 
 -- | Conditionally run an action, using a @Maybe a@ to decide.
 whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()

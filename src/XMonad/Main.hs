@@ -69,7 +69,7 @@ xmonad conf = do
     case args of
         ("--resume": ws : xs : args') -> migrateState ws xs >> launch' args'
         ["--help"]            -> usage
-        ["--recompile"]       -> recompile True >>= flip unless exitFailure
+        ["--recompile"]       -> recompile True >>= flip (unless . recompSuccess) exitFailure
         ["--restart"]         -> sendRestart
         ["--version"]         -> putStrLn $ unwords shortVersion
         ["--verbose-version"] -> putStrLn . unwords $ shortVersion ++ longVersion
@@ -115,17 +115,16 @@ buildLaunch ::  IO ()
 buildLaunch = do
     whoami <- getProgName
     let compiledConfig = "xmonad-"++arch++"-"++os
-    unless (whoami == compiledConfig) $ do
-      trace $ concat
-        [ "XMonad is recompiling and replacing itself another XMonad process because the current process is called "
-        , show whoami
-        , " but the compiled configuration should be called "
-        , show compiledConfig
-        ]
-      recompile False
-      dir  <- getXMonadDataDir
-      args <- getArgs
-      executeFile (dir </> compiledConfig) False args Nothing
+    recomp <- recompile False -- Only recompiles if needed, returns @Recompile@
+    case recomp of
+      RecompError  -> return () -- A problem has occured, run as default XMonad
+      Needed n     ->
+        -- If the current binary is `compiledConfig` and we did not
+        -- need to recompile, we're done. Otherwise, exec the correct binary
+        unless (whoami == compiledConfig && not n) $ do
+          dir  <- getXMonadDataDir
+          args <- getArgs
+          executeFile (dir </> compiledConfig) False args Nothing
 
 sendRestart :: IO ()
 sendRestart = do
